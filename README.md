@@ -10,6 +10,21 @@ Claude Code に英語で応答させ、その応答をローカルで動かす [
 - `/plamo off` で英語の表示に戻ります。訳はセッション内に残るので、もう一度 `/plamo on` にすると訳し直さずに日本語に戻ります
 - 翻訳中は応答の末尾に `⏳ PLaMo 翻訳中…`、失敗時は `⚠ PLaMo 翻訳に失敗しました (理由)` を表示します。失敗した応答は次のメッセージ送信時に再試行します
 
+## フォーク元からの変更点
+
+このリポジトリは [kikuchy/plamo-ja-mod](https://github.com/kikuchy/plamo-ja-mod) (v0.2.0) のフォークです。このフォークで加えた変更は次のとおりです。
+
+- `/plamo` コマンドを追加し、`on` / `on-input` / `off` で翻訳を切り替えるようにした。セッション開始時は無効
+- 英語で応答する指示を、`/plamo` で切り替えた後の最初の入力に 1 回添えるようにした
+- `off` にすると英語の表示に戻り、もう一度有効にすると前の訳を再利用するようにした
+- 翻訳を 1 回の応答の受信が終わってから始めるようにした (`turn.step` で検知)
+- それまでの訳を最大 8000 字ほど文脈として送るようにした
+- fullscreen 表示では、画面に映っている過去の応答だけを翻訳するようにした
+- 日本語で書かれた応答は翻訳せずに表示するようにした
+- AskUserQuestion の質問と選択肢を日本語に訳してから表示するようにした
+- `/plamo on-input` で、入力した日本語を英訳して送るようにした
+- llama-server 向けに、リクエストに `cache_prompt: true` と `id_slot: 0` を付けるようにした
+
 ## 使い方
 
 ```
@@ -22,7 +37,7 @@ Claude Code に英語で応答させ、その応答をローカルで動かす [
 
 ## 必要なもの
 
-- OpenAI 互換の Completions API (`POST /v1/completions`) を提供するローカルサーバ。[LM Studio](https://lmstudio.ai/) で動作確認しています
+- OpenAI 互換の Completions API (`POST /v1/completions`) を提供するローカルサーバ。このフォークは llama.cpp の llama-server で動作確認しています。フォーク元は [LM Studio](https://lmstudio.ai/) で動作確認されています。このフォークの変更を LM Studio で動かせるか (`cache_prompt` と `id_slot` を受け付けるか) は確認していません
 - PLaMo 3 Translate の GGUF 版モデル (0.8B / 2B / 8B / 31B)。LM Studio では MLX 版は `trust_remote_code` が必要なため読み込めません
 
 LM Studio の場合:
@@ -35,7 +50,7 @@ LM Studio の場合:
 Claude Code のターミナルセッションで:
 
 ```
-/plugin install plamo-ja --marketplace kikuchy/plamo-ja-mod
+/plugin install plamo-ja --marketplace kat0h/plamo-ja-mod
 ```
 
 マーケットプレイスの追加を聞かれたら `y`、続けてスコープを選びます。
@@ -43,10 +58,10 @@ Claude Code のターミナルセッションで:
 シェルから:
 
 ```bash
-claude plugin install plamo-ja --marketplace kikuchy/plamo-ja-mod
+claude plugin install plamo-ja --marketplace kat0h/plamo-ja-mod
 ```
 
-デスクトップアプリでは `/plugin` が使えないため、プロンプト欄横の + → Plugins → Add marketplace に `kikuchy/plamo-ja-mod` を入力し、Add plugin で追加します。
+デスクトップアプリでは `/plugin` が使えないため、プロンプト欄横の + → Plugins → Add marketplace に `kat0h/plamo-ja-mod` を入力し、Add plugin で追加します。
 
 ## 設定
 
@@ -58,7 +73,7 @@ claude plugin install plamo-ja --marketplace kikuchy/plamo-ja-mod
 | `model` | `plamo-3-translate-0.8b` | サーバ上のモデル名 (LM Studio ではモデルキー) |
 | `form` | `polite` | 訳文の文体。`polite` でです・ます調、`plain` でだ・である調 |
 
-設定は `~/.claude/settings.json` の `pluginConfigs["plamo-ja"].options` に保存されます。
+設定は `~/.claude/settings.json` の `pluginConfigs["plamo-ja@plamo-ja"].options` に保存されます。
 
 ## 制限
 
