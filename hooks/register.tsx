@@ -2,7 +2,7 @@ import type { EngineInterface, Register } from 'claude-code'
 
 type Config = { endpoint: string; model: string; form: string }
 
-// Sent once, as hidden context, when the person runs `/plamo on`.
+// Sent once, as hidden context on the next prompt after `/plamo on`.
 const ENGLISH_ON =
   'Japanese display mode is on. The user reads every reply through a local English-to-Japanese machine ' +
   'translator (PLaMo), so from now on write all user-facing text in English, even when the user writes in ' +
@@ -35,6 +35,11 @@ const ALPHA = /[A-Za-z]/g
 // off: nothing is translated. on: replies and questions. on-input: also the user's prompts.
 type Mode = 'off' | 'on' | 'on-input'
 let mode: Mode = 'off'
+// The mode Claude was last told about, and the instruction the next prompt carries (if any).
+// A command's own context would start a turn of its own, so the instruction waits for the user's next prompt.
+let instructed: Mode = 'off'
+let instruction: string | undefined
+const INSTRUCTIONS: Record<Mode, string> = { off: ENGLISH_OFF, on: ENGLISH_ON, 'on-input': ENGLISH_ON_INPUT }
 // English text -> Japanese. Insertion order is translation order, so it doubles as the context history.
 const cache = new Map<string, string>()
 // English sent to Claude -> the Japanese the user typed, to show the prompt as typed while on-input.
@@ -215,46 +220,44 @@ export const register: Register = (on, options) => {
   })
 
   on('command.run', { command: 'plamo' }, async ($, e) => {
-    const arg = e.args.trim()
-    if (arg === '' || arg === 'on') {
-      mode = 'on'
-      $.ui.invalidate('ui.render')
-      return { text: 'PLaMo 日本語表示: オン', context: [ENGLISH_ON] }
-    }
-    if (arg === 'on-input') {
-      mode = 'on-input'
-      $.ui.invalidate('ui.render')
-      return { text: 'PLaMo 日本語表示: オン (入力も英訳して送信)', context: [ENGLISH_ON_INPUT] }
-    }
-    if (arg === 'off') {
-      mode = 'off'
-      $.ui.status(undefined)
-      $.ui.invalidate('ui.render')
-      return { text: 'PLaMo 日本語表示: オフ', context: [ENGLISH_OFF] }
-    }
-    return { text: '使い方: /plamo [on|on-input|off]' }
+    const arg = e.args.trim() || 'on'
+    if (arg !== 'on' && arg !== 'on-input' && arg !== 'off') return { text: '使い方: /plamo [on|on-input|off]' }
+    mode = arg
+    // Running it again re-sends the instruction (after /compact, say); off needs none if Claude was never told.
+    instruction = mode === 'off' && instructed === 'off' ? undefined : INSTRUCTIONS[mode]
+    if (mode === 'off') $.ui.status(undefined)
+    $.ui.invalidate('ui.render')
+    const label = { on: 'オン', 'on-input': 'オン (入力も英訳して送信)', off: 'オフ' }[mode]
+    return { text: `PLaMo 日本語表示: ${label}` }
   })
 
   on('prompt.submit', async ($, e, next) => {
-    if (mode === 'off' || e.command) return next(e)
+    if (e.command || e.isMeta) return next(e)
+    let out = e
+    if (instruction !== undefined) {
+      out = { ...e, context: [...(e.context ?? []), instruction] }
+      instructed = mode
+      instruction = undefined
+    }
+    if (mode === 'off') return next(out)
     if (failed.size > 0) {
       failed.clear()
       $.ui.invalidate('ui.render')
     }
     // on-input: the user's own typed Japanese goes to Claude in English.
-    if (mode !== 'on-input' || e.isMeta || e.origin.kind !== 'composer' || !hasJapanese(e.text)) return next(e)
+    if (mode !== 'on-input' || e.origin.kind !== 'composer' || !hasJapanese(e.text)) return next(out)
     $.ui.status('PLaMo 翻訳中 (入力)')
     let english: string
     try {
       english = await translate($, config, e.text, [], TO_EN)
     } catch (err) {
       $.ui.toast(`⚠ PLaMo 入力の翻訳に失敗したので原文のまま送ります (${err instanceof Error ? err.message : String(err)})`)
-      return next(e)
+      return next(out)
     } finally {
       $.ui.status(undefined)
     }
     inputs.set(english, e.text)
-    return next({ ...e, text: english })
+    return next({ ...out, text: english })
   }).catch(($, e, next) => next(e)) // never hold up the prompt over the retry bookkeeping
 
   on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {

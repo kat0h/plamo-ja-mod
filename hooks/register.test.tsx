@@ -49,19 +49,6 @@ test('nothing is translated until /plamo on', { options: OPTIONS }, async ($, on
   expect(calls).toBe(0)
 })
 
-test('/plamo on and off send the language instruction once', { options: OPTIONS }, async ($, on) => {
-  engine(on)
-  const onResult = await plamo($, 'on')
-  expect(onResult.text).toContain('オン')
-  expect(onResult.context?.[0]).toContain('write all user-facing text in English')
-
-  const offResult = await plamo($, 'off')
-  expect(offResult.text).toContain('オフ')
-  expect(offResult.context?.[0]).toContain('Reply in Japanese again')
-
-  expect((await plamo($, 'what')).text).toContain('使い方')
-})
-
 test('a reply is replaced by its translation', { options: OPTIONS }, async ($, on) => {
   const urls: string[] = []
   engine(on)
@@ -218,14 +205,6 @@ async function userShown($: Engine, text: string) {
   return found
 }
 
-test('/plamo on-input sends the instruction about translated prompts', { options: OPTIONS }, async ($, on) => {
-  engine(on)
-  const result = await plamo($, 'on-input')
-  expect(result.text).toContain('入力も英訳')
-  expect(result.context?.[0]).toContain('machine-translated from Japanese into English')
-  await plamo($, 'off')
-})
-
 test('on-input sends the prompt in English and shows it as typed', { options: OPTIONS }, async ($, on) => {
   engine(on)
   const sent = prompts(on)
@@ -368,6 +347,53 @@ test('a reply off screen waits until it is scrolled into view', { options: OPTIO
   expect(calls).toBe(1)
   await ui.unmount()
   await plamo($, 'off')
+})
+
+
+function contexts(on: On) {
+  const seen: (readonly string[] | undefined)[] = []
+  on('prompt.submit', (_, e) => {
+    seen.push(e.context)
+    return { text: e.text }
+  })
+  return seen
+}
+
+test('/plamo answers alone; the instruction rides on the next prompt, once', { options: OPTIONS }, async ($, on) => {
+  engine(on)
+  const seen = contexts(on)
+  on('http.fetch', () => reply('Hello.'))
+
+  const result = await plamo($, 'on')
+  expect(result.text).toContain('オン')
+  expect(result.context).toBeUndefined()
+
+  await typed($, 'first')
+  await typed($, 'second')
+  expect(seen[0]?.[0]).toContain('write all user-facing text in English')
+  expect(seen[1]).toBeUndefined()
+
+  await plamo($, 'on-input')
+  await typed($, 'third')
+  expect(seen[2]?.[0]).toContain('machine-translated from Japanese into English')
+
+  await plamo($, 'off')
+  await typed($, 'fourth')
+  expect(seen[3]?.[0]).toContain('Reply in Japanese again')
+
+  expect((await plamo($, 'what')).text).toContain('使い方')
+})
+
+test('off before any prompt sends nothing', { options: OPTIONS }, async ($, on) => {
+  engine(on)
+  const seen = contexts(on)
+  await plamo($, 'off') // Claude was told "off" by the test above; start from that
+  await typed($, 'a')
+  await plamo($, 'on')
+  await plamo($, 'off')
+  await typed($, 'b')
+  // told off already: switching on and off again before a prompt says nothing more
+  expect(seen.at(-1)).toBeUndefined()
 })
 
 // Last: its fetch never answers, which keeps the module's queue busy for any test after it.
