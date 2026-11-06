@@ -276,6 +276,100 @@ test('on-input sends the Japanese when the server fails', { options: OPTIONS }, 
   await plamo($, 'off')
 })
 
+
+function response(on: On, blocks: string[]) {
+  on('turn.step', async function* (_, e) {
+    for (const [index, text] of blocks.entries()) {
+      // each block arrives in two pieces, as a streamed reply does
+      yield { kind: 'text', index, text: text.slice(0, 5) }
+      yield { kind: 'text', index, text: text.slice(5) }
+    }
+    yield { kind: 'stop', stopReason: 'end_turn', usage: null }
+    return { turnId: e.turnId, index: e.index, answer: blocks.join(''), toolUses: [], stopReason: 'end_turn', usage: null }
+  })
+}
+
+const STEP = { turnId: 't1', index: 0, model: 'm', messageCount: 1 }
+
+test('a reply is translated once its response is whole, not while it streams', { options: OPTIONS }, async ($, on) => {
+  engine(on)
+  response(on, ['First block here.', 'Second block here.'])
+  const bodies: Record<string, unknown>[] = []
+  on('http.fetch', (_, e) => {
+    bodies.push(JSON.parse(String(e.init?.body)))
+    return reply(bodies.length === 1 ? '一つ目のブロック。' : '二つ目のブロック。')
+  })
+  await plamo($, 'on')
+
+  const stream = $.turn.step(STEP)
+  const chunks: unknown[] = []
+  const first = await stream.next()
+  chunks.push(first.value)
+  // A draft drawn mid-response waits, untranslated.
+  expect(await shown($, 's1', 'First')).toContain('⏳ PLaMo 翻訳中')
+  expect(bodies.length).toBe(0)
+
+  for (;;) {
+    const step = await stream.next()
+    if (step.done) {
+      expect(step.value.answer).toBe('First block here.Second block here.')
+      break
+    }
+    chunks.push(step.value)
+  }
+  // Every chunk passes through unchanged.
+  expect(chunks.length).toBe(5)
+
+  expect(await shown($, 's1', 'First block here.')).toBe('一つ目のブロック。')
+  expect(await shown($, 's2', 'Second block here.')).toBe('二つ目のブロック。')
+  expect(bodies.length).toBe(2)
+  expect(String(bodies[0]!.prompt)).toContain('First block here.<|plamo:tag|>output')
+  expect(bodies[0]!.cache_prompt).toBe(true)
+  expect(bodies[0]!.id_slot).toBe(0)
+  await plamo($, 'off')
+})
+
+test('a subagent response is not queued', { options: OPTIONS }, async ($, on) => {
+  engine(on)
+  response(on, ['Subagent words here.'])
+  let calls = 0
+  on('http.fetch', () => {
+    calls++
+    return reply('x')
+  })
+  await plamo($, 'on')
+
+  const stream = $.turn.step({ ...STEP, agentId: 'a1' })
+  while (!(await stream.next()).done) {}
+  expect(calls).toBe(0)
+  await plamo($, 'off')
+})
+
+
+test('a reply off screen waits until it is scrolled into view', { options: OPTIONS }, async ($, on) => {
+  engine(on)
+  let calls = 0
+  on('http.fetch', () => {
+    calls++
+    return reply('見えたら訳します。')
+  })
+  await plamo($, 'on')
+
+  const at = (onScreen: { first: number; last: number; of: number } | null) =>
+    $.ui.mount({ ...MESSAGE, requestId: 'v1', props: { ...MESSAGE.props, text: 'Translate me when shown.', onScreen } })
+
+  let ui = await at(null)
+  expect((await ui.find({ type: 'Text' }))?.text).toContain('⏳ PLaMo 翻訳中')
+  expect(calls).toBe(0)
+  await ui.unmount()
+
+  ui = await at({ first: 0, last: 3, of: 4 })
+  expect((await ui.find({ type: 'Text' }))?.text).toBe('見えたら訳します。')
+  expect(calls).toBe(1)
+  await ui.unmount()
+  await plamo($, 'off')
+})
+
 // Last: its fetch never answers, which keeps the module's queue busy for any test after it.
 test('a reply shows the translating note while the server answers', { options: OPTIONS }, async ($, on) => {
   engine(on)

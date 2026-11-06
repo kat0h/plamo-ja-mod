@@ -40,8 +40,11 @@ const cache = new Map<string, string>()
 // English sent to Claude -> the Japanese the user typed, to show the prompt as typed while on-input.
 const inputs = new Map<string, string>()
 const failed = new Map<string, string>() // English text -> reason; cleared on the next prompt so it is retried
-// requestId -> newest text. A streaming reply overwrites its entry, so only the latest draft is translated.
-const wanted = new Map<string, string>()
+// Texts waiting for translation, in order. A reply joins only once its response is whole (turn.step),
+// and leaves while it is scrolled off screen, so a resumed session translates what is shown first.
+const queue: string[] = []
+// True while a main-loop response streams: the drafts drawn then are not translated.
+let isResponding = false
 let historyStart = 0
 let isBusy = false
 
@@ -104,6 +107,9 @@ async function translate(
       temperature: 0,
       max_tokens: 8192,
       stop: ['<|plamo:tag|>', '<|plamo:bos|>'],
+      // llama-server: keep every request on one slot so the shared prefix (context, history) is reused.
+      cache_prompt: true,
+      id_slot: 0,
     }),
   })
   if (!res.ok) throw new Error(`HTTP ${res.status}`)
@@ -127,7 +133,16 @@ async function translateShort($: EngineInterface, config: Config, text: string):
 }
 
 function pending(): string[] {
-  return [...wanted.values()].filter(t => !cache.has(t) && !failed.has(t))
+  return queue.filter(t => !cache.has(t) && !failed.has(t))
+}
+
+function enqueue(text: string): void {
+  if (!queue.includes(text)) queue.push(text)
+}
+
+function dequeue(text: string): void {
+  const i = queue.indexOf(text)
+  if (i >= 0) queue.splice(i, 1)
 }
 
 function withNote(text: string, note: string): string {
@@ -149,6 +164,7 @@ async function pump($: EngineInterface, config: Config): Promise<void> {
       } catch (err) {
         failed.set(text, err instanceof Error ? err.message : String(err))
       }
+      dequeue(text)
       $.ui.invalidate('ui.render')
     }
   } finally {
@@ -252,6 +268,33 @@ export const register: Register = (on, options) => {
     }
   }).catch(($, e, next) => next(e)) // never block the question: show the English if translating throws
 
+  // A response is translated once it is whole: its text blocks join the queue when the step ends.
+  on('turn.step', async function* ($, e, next) {
+    if (e.agentId !== undefined || mode === 'off') return yield* next(e)
+    const blocks = new Map<number, string>()
+    const stream = next(e)
+    isResponding = true
+    try {
+      for (;;) {
+        const step = await stream.next()
+        if (step.done) return step.value
+        const chunk = step.value
+        if (chunk.kind === 'text') blocks.set(chunk.index, (blocks.get(chunk.index) ?? '') + chunk.text)
+        yield chunk
+      }
+    } finally {
+      isResponding = false
+      if ((mode as Mode) !== 'off') {
+        for (const [, text] of [...blocks].sort(([a], [b]) => a - b)) {
+          const key = text.trim()
+          if (key && !isUntranslatable(key)) enqueue(key)
+        }
+        $.ui.invalidate('ui.render')
+        void pump($, config)
+      }
+    }
+  })
+
   // While on-input, the user's prompts show as typed; in any other mode, as sent (English).
   on('ui.render', { component: 'UserMessage' }, ($, e, next) => {
     const typed = mode === 'on-input' ? inputs.get(e.props.text) : undefined
@@ -259,16 +302,27 @@ export const register: Register = (on, options) => {
   })
 
   on('ui.render', { component: 'AssistantMessage' }, ($, e, next) => {
-    if (mode === 'off' || e.props.isSummary || isUntranslatable(e.props.text)) return next(e)
-    const japanese = cache.get(e.props.text)
+    const text = e.props.text.trim()
+    if (mode === 'off' || e.props.isSummary || isUntranslatable(text)) return next(e)
+    const japanese = cache.get(text)
     if (japanese !== undefined) return next({ ...e, props: { ...e.props, text: japanese } })
-    const reason = failed.get(e.props.text)
+    const reason = failed.get(text)
     if (reason !== undefined) {
       const note = `⚠ PLaMo 翻訳に失敗しました (${reason})。${config.endpoint} のサーバを確認してください。次のメッセージ送信時に再試行します`
       return next({ ...e, props: { ...e.props, text: withNote(e.props.text, note) } })
     }
-    wanted.set(e.requestId, e.props.text)
-    void pump($, config)
+    // Off screen (null; absent where the surface does not say): wait until it is scrolled into view.
+    if (e.props.onScreen === null) {
+      dequeue(text)
+      return next({ ...e, props: { ...e.props, text: withNote(e.props.text, '⏳ PLaMo 翻訳中…') } })
+    }
+    // A draft of the response still streaming waits for turn.step. Any other text (an earlier reply,
+    // one the step's blocks did not match) is queued from here.
+    if (!isResponding && !queue.includes(text)) {
+      $.ui.log(`plamo-ja: translating a reply turn.step did not queue (${text.length} chars)`, { to: 'debug' })
+      enqueue(text)
+      void pump($, config)
+    }
     return next({ ...e, props: { ...e.props, text: withNote(e.props.text, '⏳ PLaMo 翻訳中…') } })
   })
 }
