@@ -9,20 +9,36 @@ const ENGLISH_ON =
   'Japanese. Do not write Japanese yourself. Use plain, complete sentences that translate well, and put code, ' +
   'commands and paths in backticks or fenced blocks. Write AskUserQuestion questions and options in English ' +
   'too; they are translated before they are shown. This lasts until the user turns the mode off.'
+// Sent instead of ENGLISH_ON by `/plamo on-input`.
+const ENGLISH_ON_INPUT =
+  ENGLISH_ON +
+  " The user's messages are also machine-translated from Japanese into English before you read them, so " +
+  'they may contain translation errors; when a request seems odd, ask instead of guessing.'
 const ENGLISH_OFF = 'Japanese display mode is off. Reply in Japanese again, as before.'
 
 // What PLaMo is told about the text it translates (the PFML3 context tag).
-const TRANSLATION_CONTEXT =
+const REPLY_CONTEXT =
   'Replies from an AI coding assistant (Claude Code) to a Japanese software ' +
   'developer in a terminal. Technical terms, file paths, commands and code stay as-is.'
+const PROMPT_CONTEXT =
+  'Requests from a Japanese software developer to an AI coding assistant (Claude Code) ' +
+  'in a terminal. Technical terms, file paths, commands and code stay as-is.'
+
+type Direction = { from: 'en' | 'ja'; to: 'en' | 'ja'; context: string }
+const TO_JA: Direction = { from: 'en', to: 'ja', context: REPLY_CONTEXT } // replies, questions
+const TO_EN: Direction = { from: 'ja', to: 'en', context: PROMPT_CONTEXT } // the user's prompts
 const HISTORY_BUDGET = 8000 // max chars of earlier (English, Japanese) pairs sent as context
 
 const JA = /[぀-ヿ㐀-鿿ｦ-ﾟ]/g
 const ALPHA = /[A-Za-z]/g
 
-let enabled = false
+// off: nothing is translated. on: replies and questions. on-input: also the user's prompts.
+type Mode = 'off' | 'on' | 'on-input'
+let mode: Mode = 'off'
 // English text -> Japanese. Insertion order is translation order, so it doubles as the context history.
 const cache = new Map<string, string>()
+// English sent to Claude -> the Japanese the user typed, to show the prompt as typed while on-input.
+const inputs = new Map<string, string>()
 const failed = new Map<string, string>() // English text -> reason; cleared on the next prompt so it is retried
 // requestId -> newest text. A streaming reply overwrites its entry, so only the latest draft is translated.
 const wanted = new Map<string, string>()
@@ -31,6 +47,10 @@ let isBusy = false
 
 function escape(text: string): string {
   return text.replaceAll('<|plamo:', '<|plamo :')
+}
+
+function hasJapanese(text: string): boolean {
+  return (text.match(JA)?.length ?? 0) > 0
 }
 
 /** Nothing to translate: no English letters, or mostly Japanese already. */
@@ -54,18 +74,17 @@ function history(): [string, string][] {
   return pairs.slice(historyStart)
 }
 
-function pfml3(text: string, form: string, pairs: [string, string][]): string {
-  let prompt = `<|plamo:tag|>dataset<|plamo:msg|>translation<|plamo:tag|>context<|plamo:msg|>${TRANSLATION_CONTEXT}`
-  for (const [en, ja] of pairs) {
-    prompt +=
-      `<|plamo:tag|>input<|plamo:key|>lang<|plamo:val|>en<|plamo:msg|>${escape(en)}` +
-      `<|plamo:tag|>output<|plamo:key|>lang<|plamo:val|>ja<|plamo:msg|>${escape(ja)}`
+/** A PFML3 prompt; `pairs` are earlier (source, translation) pairs in the same direction. */
+function pfml3(text: string, dir: Direction, form: string, pairs: [string, string][]): string {
+  const input = `<|plamo:tag|>input<|plamo:key|>lang<|plamo:val|>${dir.from}<|plamo:msg|>`
+  const output = `<|plamo:tag|>output<|plamo:key|>lang<|plamo:val|>${dir.to}`
+  let prompt = `<|plamo:tag|>dataset<|plamo:msg|>translation<|plamo:tag|>context<|plamo:msg|>${dir.context}`
+  for (const [source, translation] of pairs) {
+    prompt += `${input}${escape(source)}${output}<|plamo:msg|>${escape(translation)}`
   }
-  return (
-    prompt +
-    `<|plamo:tag|>input<|plamo:key|>lang<|plamo:val|>en<|plamo:msg|>${escape(text)}` +
-    `<|plamo:tag|>output<|plamo:key|>lang<|plamo:val|>ja<|plamo:key|>form<|plamo:val|>${form}<|plamo:msg|>`
-  )
+  // form (です・ます / だ・である) applies to Japanese output only.
+  const style = dir.to === 'ja' ? `<|plamo:key|>form<|plamo:val|>${form}` : ''
+  return `${prompt}${input}${escape(text)}${output}${style}<|plamo:msg|>`
 }
 
 async function translate(
@@ -73,6 +92,7 @@ async function translate(
   config: Config,
   text: string,
   pairs: [string, string][] = [],
+  dir: Direction = TO_JA,
 ): Promise<string> {
   // The GGUF build's bundled chat template ignores chat_template_kwargs, so the PFML3 prompt goes to the Completions API as is.
   const res = await $.http.fetch(`${config.endpoint.replace(/\/+$/, '')}/completions`, {
@@ -80,16 +100,16 @@ async function translate(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       model: config.model,
-      prompt: pfml3(text, config.form, pairs),
+      prompt: pfml3(text, dir, config.form, pairs),
       temperature: 0,
       max_tokens: 8192,
       stop: ['<|plamo:tag|>', '<|plamo:bos|>'],
     }),
   })
   if (!res.ok) throw new Error(`HTTP ${res.status}`)
-  const japanese: string = JSON.parse(res.text).choices[0].text.trim()
-  if (!japanese) throw new Error('empty output')
-  return japanese
+  const translation: string = JSON.parse(res.text).choices[0].text.trim()
+  if (!translation) throw new Error('empty output')
+  return translation
 }
 
 /** Translates a short UI string (no history), cached; the English on any failure. */
@@ -119,7 +139,7 @@ async function pump($: EngineInterface, config: Config): Promise<void> {
   isBusy = true
   try {
     for (;;) {
-      if (!enabled) break
+      if (mode === 'off') break
       const [text] = pending()
       if (text === undefined) break
       $.ui.status(`PLaMo 翻訳中 (残り ${pending().length} 件)`)
@@ -171,8 +191,8 @@ export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'plamo',
-      description: 'PLaMo で応答を日本語表示する (on / off)',
-      argumentHint: '[on|off]',
+      description: 'PLaMo で応答を日本語表示する (on / on-input で入力も英訳 / off)',
+      argumentHint: '[on|on-input|off]',
       immediate: true,
     })
     return next(e)
@@ -181,29 +201,48 @@ export const register: Register = (on, options) => {
   on('command.run', { command: 'plamo' }, async ($, e) => {
     const arg = e.args.trim()
     if (arg === '' || arg === 'on') {
-      enabled = true
+      mode = 'on'
       $.ui.invalidate('ui.render')
       return { text: 'PLaMo 日本語表示: オン', context: [ENGLISH_ON] }
     }
+    if (arg === 'on-input') {
+      mode = 'on-input'
+      $.ui.invalidate('ui.render')
+      return { text: 'PLaMo 日本語表示: オン (入力も英訳して送信)', context: [ENGLISH_ON_INPUT] }
+    }
     if (arg === 'off') {
-      enabled = false
+      mode = 'off'
       $.ui.status(undefined)
       $.ui.invalidate('ui.render')
       return { text: 'PLaMo 日本語表示: オフ', context: [ENGLISH_OFF] }
     }
-    return { text: '使い方: /plamo [on|off]' }
+    return { text: '使い方: /plamo [on|on-input|off]' }
   })
 
-  on('prompt.submit', ($, e, next) => {
-    if (enabled && !e.command && failed.size > 0) {
+  on('prompt.submit', async ($, e, next) => {
+    if (mode === 'off' || e.command) return next(e)
+    if (failed.size > 0) {
       failed.clear()
       $.ui.invalidate('ui.render')
     }
-    return next(e)
+    // on-input: the user's own typed Japanese goes to Claude in English.
+    if (mode !== 'on-input' || e.isMeta || e.origin.kind !== 'composer' || !hasJapanese(e.text)) return next(e)
+    $.ui.status('PLaMo 翻訳中 (入力)')
+    let english: string
+    try {
+      english = await translate($, config, e.text, [], TO_EN)
+    } catch (err) {
+      $.ui.toast(`⚠ PLaMo 入力の翻訳に失敗したので原文のまま送ります (${err instanceof Error ? err.message : String(err)})`)
+      return next(e)
+    } finally {
+      $.ui.status(undefined)
+    }
+    inputs.set(english, e.text)
+    return next({ ...e, text: english })
   }).catch(($, e, next) => next(e)) // never hold up the prompt over the retry bookkeeping
 
   on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {
-    if (!enabled) return next(e)
+    if (mode === 'off') return next(e)
     $.ui.status('PLaMo 翻訳中 (質問)')
     try {
       const questions = await Promise.all(e.questions.map(q => translateQuestion($, config, q)))
@@ -213,8 +252,14 @@ export const register: Register = (on, options) => {
     }
   }).catch(($, e, next) => next(e)) // never block the question: show the English if translating throws
 
+  // While on-input, the user's prompts show as typed; in any other mode, as sent (English).
+  on('ui.render', { component: 'UserMessage' }, ($, e, next) => {
+    const typed = mode === 'on-input' ? inputs.get(e.props.text) : undefined
+    return typed === undefined ? next(e) : next({ ...e, props: { ...e.props, text: typed } })
+  })
+
   on('ui.render', { component: 'AssistantMessage' }, ($, e, next) => {
-    if (!enabled || e.props.isSummary || isUntranslatable(e.props.text)) return next(e)
+    if (mode === 'off' || e.props.isSummary || isUntranslatable(e.props.text)) return next(e)
     const japanese = cache.get(e.props.text)
     if (japanese !== undefined) return next({ ...e, props: { ...e.props, text: japanese } })
     const reason = failed.get(e.props.text)

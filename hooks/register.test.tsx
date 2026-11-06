@@ -190,6 +190,92 @@ test('AskUserQuestion stays in English when the server fails', { options: OPTION
   expect(q.question).toBe('Which color?')
 })
 
+function prompts(on: On) {
+  const sent: string[] = []
+  on('prompt.submit', (_, e) => {
+    sent.push(e.text)
+    return { text: e.text }
+  })
+  on('ui.render', { component: 'UserMessage' }, ($, e) => {
+    const { Text } = $.ui.resolve(e)
+    return <Text>{e.props.text}</Text>
+  })
+  return sent
+}
+
+const typed = ($: Engine, text: string) => $.prompt.submit({ text, origin: { kind: 'composer' }, wait: false })
+
+async function userShown($: Engine, text: string) {
+  const ui = await $.ui.mount({
+    plugin: 'plamo-ja',
+    surface: 'desktop',
+    component: 'UserMessage',
+    requestId: 'u1',
+    props: { text, origin: { kind: 'composer' }, isExpanded: true },
+  })
+  const found = (await ui.find({ type: 'Text' }))?.text
+  await ui.unmount()
+  return found
+}
+
+test('/plamo on-input sends the instruction about translated prompts', { options: OPTIONS }, async ($, on) => {
+  engine(on)
+  const result = await plamo($, 'on-input')
+  expect(result.text).toContain('入力も英訳')
+  expect(result.context?.[0]).toContain('machine-translated from Japanese into English')
+  await plamo($, 'off')
+})
+
+test('on-input sends the prompt in English and shows it as typed', { options: OPTIONS }, async ($, on) => {
+  engine(on)
+  const sent = prompts(on)
+  const bodies: string[] = []
+  on('http.fetch', (_, e) => {
+    bodies.push(JSON.parse(String(e.init?.body)).prompt)
+    return reply(' Please fix the test. ')
+  })
+  await plamo($, 'on-input')
+
+  await typed($, 'テストを直してください。')
+  expect(sent).toEqual(['Please fix the test.'])
+  expect(bodies[0]).toContain('<|plamo:val|>ja<|plamo:msg|>テストを直してください。')
+  expect(bodies[0]!.endsWith('<|plamo:tag|>output<|plamo:key|>lang<|plamo:val|>en<|plamo:msg|>')).toBe(true)
+  expect(await userShown($, 'Please fix the test.')).toBe('テストを直してください。')
+
+  // Back to plain on: the prompt shows as it was sent.
+  await plamo($, 'on')
+  expect(await userShown($, 'Please fix the test.')).toBe('Please fix the test.')
+  await plamo($, 'off')
+})
+
+test('plain on sends the prompt as typed', { options: OPTIONS }, async ($, on) => {
+  engine(on)
+  const sent = prompts(on)
+  let calls = 0
+  on('http.fetch', () => {
+    calls++
+    return reply('x')
+  })
+  await plamo($, 'on')
+
+  await typed($, 'そのまま送ってください。')
+  expect(sent).toEqual(['そのまま送ってください。'])
+  expect(calls).toBe(0)
+  await plamo($, 'off')
+})
+
+test('on-input sends the Japanese when the server fails', { options: OPTIONS }, async ($, on) => {
+  engine(on)
+  on('ui.toast', () => ({ value: undefined }))
+  const sent = prompts(on)
+  on('http.fetch', () => ({ value: { status: 500, ok: false, headers: {}, text: '' } }))
+  await plamo($, 'on-input')
+
+  await typed($, '失敗しても送ってください。')
+  expect(sent).toEqual(['失敗しても送ってください。'])
+  await plamo($, 'off')
+})
+
 // Last: its fetch never answers, which keeps the module's queue busy for any test after it.
 test('a reply shows the translating note while the server answers', { options: OPTIONS }, async ($, on) => {
   engine(on)

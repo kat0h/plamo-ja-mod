@@ -1,7 +1,7 @@
 {
   "name": "plamo-ja",
-  "version": "0.3.0",
-  "description": "Run /plamo on to have Claude reply in English and see each reply in Japanese, translated by PLaMo 3 Translate on a local OpenAI-compatible server (LM Studio, llama.cpp); /plamo off shows the English again",
+  "version": "0.4.0",
+  "description": "Run /plamo on to have Claude reply in English and see each reply in Japanese, translated by PLaMo 3 Translate on a local OpenAI-compatible server (LM Studio, llama.cpp); /plamo on-input also sends your Japanese prompts in English; /plamo off shows the English again",
   "author": {
     "name": "kikuchy"
   },
